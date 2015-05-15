@@ -11,13 +11,15 @@
 #ifndef SCANNER_H
 #define SCANNER_H
 
+#include "hashtable.h"
+
 #define PCRE_STATIC
 #include <pcre.h>
 
-#define BLOCK_SIZE_PATTERNS 50
-#define BLOCK_SIZE_TOKENS 50
+#define BLOCK_SIZE_PATTERNS 64
+#define BLOCK_SIZE_TOKENS 256
 
-#define MAX_EXC_STRING 200
+#define MAX_EXC_STRING 4096
 
 #define SCANNER_EXC_BAD_TOKEN (long)-1
 #define SCANNER_EXC_RESTRICTED (long)-2
@@ -37,20 +39,19 @@ typedef struct {
 } Token;
 
 typedef struct {
-	int patterns_sz;
-	Pattern **patterns;
+	Hashtable *patterns;
 } Restriction;
 
 typedef struct {
+	Hashtable *restrictions_cache;
 	char exc[MAX_EXC_STRING];
-    int ignore_sz;
-    Pattern **ignore;
-    int tokens_sz;
-    int tokens_bsz;
-    Token *tokens;
-    Restriction *restrictions;
-    int input_sz;
-    char *input;
+	Hashtable *ignore;
+	int tokens_sz;
+	int tokens_bsz;
+	Token *tokens;
+	Restriction *restrictions;
+	int input_sz;
+	char *input;
 	int pos;
 } Scanner;
 
@@ -62,7 +63,7 @@ void Scanner_reset(Scanner *self, char *input, int input_sz);
 Scanner *Scanner_new(Pattern *, int, Pattern *, int, char *, int);
 void Scanner_del(Scanner *);
 
-Token* Scanner_token(Scanner *, int, Pattern *, int);
+Token* Scanner_token(Scanner *, int, Hashtable *restrictions);
 void Scanner_rewind(Scanner *, int);
 
 #endif

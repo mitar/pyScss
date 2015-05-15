@@ -1,26 +1,38 @@
 #!/usr/bin/env python
-import os
-import sys
-from setuptools import setup, Extension, Feature
 from distutils.command.build_ext import build_ext
 from distutils.errors import CCompilerError, DistutilsExecError, \
     DistutilsPlatformError
+import os
+import platform
+import sys
 
-from scss.scss_meta import PROJECT, URL, VERSION, AUTHOR, AUTHOR_EMAIL, LICENSE, DOWNLOAD_URL
+from setuptools import setup, Extension, Feature
+
+# this imports PROJECT, URL, VERSION, AUTHOR, AUTHOR_EMAIL, LICENSE,
+# DOWNLOAD_URL
+with open('scss/scss_meta.py', 'rb') as f:
+    exec(f.read())
+
+# Dependencies
+install_requires = ['six']
+if sys.version_info < (3, 4):
+    install_requires.append('enum34')
+    install_requires.append('pathlib')
+if sys.version_info < (2, 7):
+    install_requires.append('ordereddict')
 
 # fail safe compilation shamelessly stolen from the simplejson
 # setup.py file.  Original author: Bob Ippolito
-
-is_jython = 'java' in sys.platform
-is_pypy = hasattr(sys, 'pypy_version_info')
 
 speedups = Feature(
     'optional C speed-enhancement module',
     standard=True,
     ext_modules=[
+        # NOTE: header files are included by MANIFEST.in; Extension does not
+        # include headers in an sdist (since they're typically in /usr/lib)
         Extension(
-            'scss._speedups',
-            sources=['scss/src/_speedups.c', 'scss/src/block_locator.c', 'scss/src/scanner.c'],
+            'scss.grammar._scanner',
+            sources=['scss/src/_speedups.c', 'scss/src/block_locator.c', 'scss/src/scanner.c', 'scss/src/hashtable.c'],
             libraries=['pcre']
         ),
     ],
@@ -31,11 +43,6 @@ if sys.platform == 'win32' and sys.version_info > (2, 6):
     # 2.6's distutils.msvc9compiler can raise an IOError when failing to
     # find the compiler
     ext_errors += (IOError,)
-
-
-extra = {}
-if sys.version_info >= (3, 0):
-    extra['use_2to3'] = True
 
 
 class BuildFailed(Exception):
@@ -69,7 +76,8 @@ def echo(msg=''):
 
 def read(fname):
     try:
-        return open(os.path.join(os.path.dirname(__file__), fname)).read().strip()
+        with open(os.path.join(os.path.dirname(__file__), fname), 'rb') as f:
+            return f.read().decode('utf8').strip()
     except IOError:
         return ''
 
@@ -100,15 +108,20 @@ def run_setup(with_binary):
             "Topic :: Text Processing :: Markup",
             "Topic :: Software Development :: Libraries :: Python Modules"
         ],
-        packages=['scss'],
-        package_data={'scss': ['tests.rst']},
+        install_requires=install_requires,
+        packages=[
+            'scss',
+            'scss.extension',
+            'scss.extension.compass',
+            'scss.grammar',
+        ],
         cmdclass={'build_ext': ve_build_ext},
         features=features,
         entry_points="""
         [console_scripts]
         pyscss = scss.tool:main
+        less2scss = scss.less2scss:main
         """,
-        **extra
     )
 
 
@@ -130,11 +143,16 @@ def try_building_extension():
 
         echo(LINE)
         echo(BUILD_EXT_WARNING)
+        echo('pyScss will still work fine, but may be slower.')
+        echo(
+            'The most likely cause is missing PCRE headers; you may need to '
+            'install libpcre or libpcre-dev, depending on your platform.'
+        )
         echo('Plain-Python installation succeeded.')
         echo(LINE)
 
 
-if not (is_pypy or is_jython):
+if platform.python_implementation() == 'CPython':
     try_building_extension()
 else:
     run_setup(False)

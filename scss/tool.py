@@ -1,24 +1,54 @@
 #!/usr/bin/env python
 from __future__ import absolute_import
+from __future__ import print_function
 
+from collections import deque
+from contextlib import contextmanager
 import logging
 import os
 import re
 import sys
-from collections import deque
 
-import scss
-from scss import Scss, log, spawn_rule, to_str, profiling
-from scss import _prop_split_re
+from scss import config
+from scss.calculator import Calculator
+from scss.compiler import _prop_split_re
+from scss.compiler import Compiler
+from scss.errors import SassEvaluationError
+from scss.legacy import Scss
+from scss.legacy import _default_scss_vars
+from scss.namespace import Namespace
+from scss.rule import SassRule
+from scss.rule import UnparsedBlock
 from scss.scss_meta import BUILD_INFO
+from scss.source import SourceFile
+from scss.util import profiling
 
-log.setLevel(logging.INFO)
+try:
+    raw_input
+except NameError:
+    raw_input = input
+
+log = logging.getLogger(__name__)
+logging.getLogger('scss').setLevel(logging.INFO)
 
 
 def main():
     logging.basicConfig(format="%(levelname)s: %(message)s")
 
     from optparse import OptionGroup, OptionParser, SUPPRESS_HELP
+
+    if hasattr(config.LOAD_PATHS, 'split'):
+        initial_load_paths = [p.strip() for p in config.LOAD_PATHS.split(',')]
+    else:
+        initial_load_paths = list(config.LOAD_PATHS)
+
+    def append_load_path(option, opt_str, value, parser):
+        dest = getattr(parser.values, option.dest)
+        paths = value.replace(os.pathsep, ',').replace(';', ',').split(',')
+        for path in paths:
+            path = path.strip()
+            if path and path not in dest:
+                dest.append(path)
 
     parser = OptionParser(usage="Usage: %prog [options] [file]",
                           description="Converts Scss files to CSS.",
@@ -27,22 +57,24 @@ def main():
                       help="Run an interactive Scss shell")
     parser.add_option("-w", "--watch", metavar="DIR",
                       help="Watch the files in DIR, and recompile when they change")
-    parser.add_option("-r", "--recursive", action="store_true",
+    parser.add_option("-r", "--recursive", action="store_true", default=False,
                       help="Also watch directories inside of the watch directory")
     parser.add_option("-o", "--output", metavar="PATH",
                       help="Write output to PATH (a directory if using watch, a file otherwise)")
     parser.add_option("-s", "--suffix", metavar="STRING",
                       help="If using watch, a suffix added to the output filename (i.e. filename.STRING.css)")
     parser.add_option("--time", action="store_true",
-                      help="Display compliation times")
+                      help="Ignored, will be removed in 2.0")
     parser.add_option("--debug-info", action="store_true",
-                      help="Turns on scss's debuging information")
+                      help="Turns on scss's debugging information")
     parser.add_option("--no-debug-info", action="store_false",
                       dest="debug_info", default=False,
-                      help="Turns off scss's debuging information")
-    parser.add_option("-t", "--test", action="store_true", help=SUPPRESS_HELP)
-    parser.add_option("-C", "--no-compress", action="store_false",
-                      dest="compress", default=True,
+                      help="Turns off scss's debugging information")
+    parser.add_option("-T", "--test", action="store_true", help=SUPPRESS_HELP)
+    parser.add_option("-t", "--style", metavar="NAME",
+                      dest="style", default='nested',
+                      help="Output style. Can be nested (default), compact, compressed, or expanded.")
+    parser.add_option("-C", "--no-compress", action="store_false", dest="style", default=True,
                       help="Don't minify outputted CSS")
     parser.add_option("-?", action="help", help=SUPPRESS_HELP)
     parser.add_option("-h", "--help", action="help",
@@ -51,270 +83,344 @@ def main():
                       help="Print version and exit")
 
     paths_group = OptionGroup(parser, "Resource Paths")
-    paths_group.add_option("-I", "--load-path", metavar="PATH",
-                      action="append", dest="load_paths",
+    paths_group.add_option("-I", "--load-path", metavar="PATH", type="string",
+                      action="callback", callback=append_load_path, dest="load_paths",
+                      default=initial_load_paths,
                       help="Add a scss import path, may be given multiple times")
     paths_group.add_option("-S", "--static-root", metavar="PATH", dest="static_root",
                       help="Static root path (Where images and static resources are located)")
     paths_group.add_option("-A", "--assets-root", metavar="PATH", dest="assets_root",
                       help="Assets root path (Sprite images will be created here)")
+    paths_group.add_option("-a", "--assets-url", metavar="URL", dest="assets_url",
+                      help="URL to reach the files in your assets_root")
+    paths_group.add_option("-F", "--fonts-root", metavar="PATH", dest="fonts_root",
+                      help="Fonts root path (Where fonts are located)")
+    paths_group.add_option("-f", "--fonts-url", metavar="PATH", dest="fonts_url",
+                      help="URL to reach the fonts in your fonts_root")
+    paths_group.add_option("--images-root", metavar="PATH", dest="images_root",
+                      help="Images root path (Where images are located)")
+    paths_group.add_option("--images-url", metavar="PATH", dest="images_url",
+                      help="URL to reach the images in your images_root")
+    paths_group.add_option("--cache-root", metavar="PATH", dest="cache_root",
+                      help="Cache root path (Cache files will be created here)")
     parser.add_option_group(paths_group)
 
-    (options, args) = parser.parse_args()
+    parser.add_option("--sass", action="store_true",
+                      dest="is_sass", default=None,
+                      help="Sass mode")
+
+    options, args = parser.parse_args()
 
     # General runtime configuration
-    scss.VERBOSITY = 0
-    if options.time:
-        scss.VERBOSITY = 2
     if options.static_root is not None:
-        scss.STATIC_ROOT = options.static_root
+        config.STATIC_ROOT = options.static_root
     if options.assets_root is not None:
-        scss.ASSETS_ROOT = options.assets_root
-    if options.load_paths is not None:
-        # TODO: Convert global LOAD_PATHS to a list. Use it directly.
-        # Doing the above will break backwards compatibility!
-        if hasattr(scss.LOAD_PATHS, 'split'):
-            load_path_list = [p.strip() for p in scss.LOAD_PATHS.split(',')]
-        else:
-            load_path_list = list(scss.LOAD_PATHS)
+        config.ASSETS_ROOT = options.assets_root
 
-        for path_param in options.load_paths:
-            for p in path_param.replace(os.pathsep, ',').replace(';', ',').split(','):
-                p = p.strip()
-                if p and p not in load_path_list:
-                    load_path_list.append(p)
+    if options.fonts_root is not None:
+        config.FONTS_ROOT = options.fonts_root
+    if options.fonts_url is not None:
+        config.FONTS_URL = options.fonts_url
 
-        # TODO: Remove this once global LOAD_PATHS is a list.
-        if hasattr(scss.LOAD_PATHS, 'split'):
-            scss.LOAD_PATHS = ','.join(load_path_list)
-        else:
-            scss.LOAD_PATHS = load_path_list
+    if options.images_root is not None:
+        config.IMAGES_ROOT = options.images_root
+    if options.images_url is not None:
+        config.IMAGES_URL = options.images_url
+
+    if options.cache_root is not None:
+        config.CACHE_ROOT = options.cache_root
+    if options.assets_url is not None:
+        config.ASSETS_URL = options.assets_url
 
     # Execution modes
     if options.test:
-        import doctest
-        doctest.testfile('tests.rst')
+        run_tests()
     elif options.version:
-        print BUILD_INFO
+        print_version()
     elif options.interactive:
-        from pprint import pprint
+        run_repl(options)
+    elif options.watch:
+        watch_sources(options)
+    else:
+        do_build(options, args)
+
+
+def print_version():
+    print(BUILD_INFO)
+
+
+def run_tests():
+    try:
+        import pytest
+    except ImportError:
+        raise ImportError("You need py.test installed to run the test suite.")
+    pytest.main("")  # don't let py.test re-consume our arguments
+
+
+def do_build(options, args):
+    if options.output is not None:
+        out = open(options.output, 'wb')
+    else:
+        out = sys.stdout
+        # Get the unencoded stream on Python 3
+        out = getattr(out, 'buffer', out)
+
+    css = Scss(scss_opts={
+        'style': options.style,
+        'debug_info': options.debug_info,
+    },
+        search_paths=options.load_paths,
+    )
+    if not args:
+        args = ['-']
+    source_files = []
+    for path in args:
+        if path == '-':
+            source = SourceFile.from_file(sys.stdin, relpath="<stdin>", is_sass=options.is_sass)
+        else:
+            source = SourceFile.from_filename(path, is_sass=options.is_sass)
+        source_files.append(source)
+
+    encodings = set(source.encoding for source in source_files)
+    if len(encodings) > 1:
+        sys.stderr.write(
+            "Can't combine these files!  "
+            "They have different encodings: {0}\n"
+            .format(', '.join(encodings))
+        )
+        sys.exit(3)
+
+    output = css.compile(source_files=source_files)
+    out.write(output.encode(source_files[0].encoding))
+
+    for f, t in profiling.items():
+        sys.stderr.write("%s took %03fs" % (f, t))
+
+
+def watch_sources(options):
+    import time
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import PatternMatchingEventHandler
+    except ImportError:
+        sys.stderr.write("Using watch functionality requires the `watchdog` library: http://pypi.python.org/pypi/watchdog/")
+        sys.exit(1)
+    if options.output and not os.path.isdir(options.output):
+        sys.stderr.write("watch file output directory is invalid: '%s'" % (options.output))
+        sys.exit(2)
+
+    class ScssEventHandler(PatternMatchingEventHandler):
+        def __init__(self, *args, **kwargs):
+            super(ScssEventHandler, self).__init__(*args, **kwargs)
+            self.css = Scss(scss_opts={
+                'style': options.style,
+                'debug_info': options.debug_info,
+            },
+                search_paths=options.load_paths,
+            )
+            self.output = options.output
+            self.suffix = options.suffix
+
+        def is_valid(self, path):
+            return os.path.isfile(path) and (path.endswith('.scss') or path.endswith('.sass')) and not os.path.basename(path).startswith('_')
+
+        def process(self, path):
+            if os.path.isdir(path):
+                for f in os.listdir(path):
+                    full = os.path.join(path, f)
+                    if self.is_valid(full):
+                        self.compile(full)
+            elif self.is_valid(path):
+                self.compile(path)
+
+        def compile(self, src_path):
+            fname = os.path.basename(src_path)
+            if fname.endswith('.scss') or fname.endswith('.sass'):
+                fname = fname[:-5]
+                if self.suffix:
+                    fname += '.' + self.suffix
+                fname += '.css'
+            else:
+                # you didn't give me a file of the correct type!
+                return False
+
+            if self.output:
+                dest_path = os.path.join(self.output, fname)
+            else:
+                dest_path = os.path.join(os.path.dirname(src_path), fname)
+
+            print("Compiling %s => %s" % (src_path, dest_path))
+            dest_file = open(dest_path, 'wb')
+            dest_file.write(self.css.compile(scss_file=src_path).encode('utf-8'))
+
+        def on_moved(self, event):
+            super(ScssEventHandler, self).on_moved(event)
+            self.process(event.dest_path)
+
+        def on_created(self, event):
+            super(ScssEventHandler, self).on_created(event)
+            self.process(event.src_path)
+
+        def on_modified(self, event):
+            super(ScssEventHandler, self).on_modified(event)
+            self.process(event.src_path)
+
+    event_handler = ScssEventHandler(patterns=['*.scss', '*.sass'])
+    observer = Observer()
+    observer.schedule(event_handler, path=options.watch, recursive=options.recursive)
+    observer.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+
+
+@contextmanager
+def readline_history(fn):
+    try:
+        import readline
+    except ImportError:
+        yield
+        return
+
+    try:
+        readline.read_history_file(fn)
+    except IOError:
+        pass
+
+    try:
+        yield
+    finally:
         try:
-            import atexit
-            import readline
-            histfile = os.path.expanduser('~/.scss-history')
-            try:
-                readline.read_history_file(histfile)
-            except IOError:
-                pass
-            atexit.register(readline.write_history_file, histfile)
-        except ImportError:
+            readline.write_history_file(fn)
+        except IOError:
             pass
 
-        css = Scss()
-        context = css.scss_vars
-        options = css.scss_opts
-        rule = spawn_rule(context=context, options=options)
-        print "Welcome to %s interactive shell" % BUILD_INFO
+
+def run_repl(is_sass=False):
+    repl = SassRepl()
+
+    with readline_history(os.path.expanduser('~/.scss-history')):
+        print("Welcome to %s interactive shell" % (BUILD_INFO,))
         while True:
             try:
-                s = raw_input('>>> ').strip()
-            except EOFError:
-                print
-                break
-            except KeyboardInterrupt:
-                print
-                break
-            if s in ('exit', 'quit'):
-                break
-            for s in s.split(';'):
-                s = css.load_string(s.strip())
-                if not s:
+                in_ = raw_input('>>> ').strip()
+                for output in repl(in_):
+                    print(output)
+            except (EOFError, KeyboardInterrupt):
+                print("Bye!")
+                return
+
+
+class SassRepl(object):
+    def __init__(self, is_sass=False):
+        # TODO it would be lovely to get these out of here, somehow
+        self.namespace = Namespace(variables=_default_scss_vars)
+
+        self.compiler = Compiler(namespace=self.namespace)
+        self.compilation = self.compiler.make_compilation()
+        self.legacy_compiler_options = {}
+        self.source_file = SourceFile.from_string('', '<shell>', is_sass=is_sass)
+        self.calculator = Calculator(self.namespace)
+
+    def __call__(self, s):
+        # TODO this is kind of invasive; surely it's possible to do this
+        # without calling only private methods
+        from pprint import pformat
+
+        if s in ('exit', 'quit'):
+            raise KeyboardInterrupt
+
+        for s in s.split(';'):
+            s = self.source_file.prepare_source(s.strip())
+            if not s:
+                continue
+            elif s.startswith('@'):
+                scope = None
+                properties = []
+                children = deque()
+                rule = SassRule(self.source_file, namespace=self.namespace, legacy_compiler_options=self.legacy_compiler_options, properties=properties)
+                block = UnparsedBlock(rule, 1, s, None)
+                code, name = (s.split(None, 1) + [''])[:2]
+                if code == '@option':
+                    self.compilation._at_options(self.calculator, rule, scope, block)
                     continue
-                elif s.startswith('@'):
-                    properties = []
-                    children = deque()
-                    spawn_rule(fileid='<string>', context=context, options=options, properties=properties)
-                    code, name = (s.split(None, 1) + [''])[:2]
-                    if code == '@option':
-                        css._settle_options(rule, [''], set(), children, None, None, s, None, code, name)
-                        continue
-                    elif code == '@import':
-                        css._do_import(rule, [''], set(), children, None, None, s, None, code, name)
-                        continue
-                    elif code == '@include':
-                        final_cont = ''
-                        css._do_include(rule, [''], set(), children, None, None, s, None, code, name)
-                        code = css._print_properties(properties).rstrip('\n')
+                elif code == '@import':
+                    self.compilation._at_import(self.calculator, rule, scope, block)
+                    continue
+                elif code == '@include':
+                    final_cont = ''
+                    self.compilation._at_include(self.calculator, rule, scope, block)
+                    code = self.compilation._print_properties(properties).rstrip('\n')
+                    if code:
+                        final_cont += code
+                    if children:
+                        self.compilation.children.extendleft(children)
+                        self.compilation.parse_children()
+                        code = self.compilation._create_css(self.compilation.rules).rstrip('\n')
                         if code:
                             final_cont += code
-                        if children:
-                            css.children.extendleft(children)
-                            css.parse_children()
-                            code = css._create_css(css.rules).rstrip('\n')
-                            if code:
-                                final_cont += code
-                        final_cont = css.post_process(final_cont)
-                        print final_cont
-                        continue
-                elif s == 'ls' or s.startswith('show(') or s.startswith('show ') or s.startswith('ls(') or s.startswith('ls '):
-                    m = re.match(r'(?:show|ls)(\()?\s*([^,/\\) ]*)(?:[,/\\ ]([^,/\\ )]+))*(?(1)\))', s, re.IGNORECASE)
-                    if m:
-                        name = m.group(2)
-                        code = m.group(3)
-                        name = name and name.strip().rstrip('s')  # remove last 's' as in functions
-                        code = code and code.strip()
-                        if not name:
-                            pprint(sorted(['vars', 'options', 'mixins', 'functions']))
-                        elif name in ('v', 'var', 'variable'):
-                            if code == '*':
-                                d = dict((k, v) for k, v in context.items())
-                                pprint(d)
-                            elif code:
-                                d = dict((k, v) for k, v in context.items() if code in k)
-                                pprint(d)
-                            else:
-                                d = dict((k, v) for k, v in context.items() if k.startswith('$') and not k.startswith('$__'))
-                                pprint(d)
-                        elif name in ('o', 'opt', 'option'):
-                            if code == '*':
-                                d = dict((k, v) for k, v in options.items())
-                                pprint(d)
-                            elif code:
-                                d = dict((k, v) for k, v in options.items() if code in k)
-                                pprint(d)
-                            else:
-                                d = dict((k, v) for k, v in options.items() if not k.startswith('@'))
-                                pprint(d)
-                        elif name in ('m', 'mix', 'mixin', 'f', 'func', 'funct', 'function'):
-                            if name.startswith('m'):
-                                name = 'mixin'
-                            elif name.startswith('f'):
-                                name = 'function'
-                            if code == '*':
-                                d = dict((k[len(name) + 2:], v) for k, v in options.items() if k.startswith('@' + name + ' '))
-                                pprint(sorted(d))
-                            elif code:
-                                d = dict((k, v) for k, v in options.items() if k.startswith('@' + name + ' ') and code in k)
-                                seen = set()
-                                for k, mixin in d.items():
-                                    mixin = getattr(mixin, 'mixin', mixin)
-                                    fn_name, _, _ = k.partition(':')
-                                    if fn_name not in seen:
-                                        seen.add(fn_name)
-                                        print fn_name + '(' + ', '.join(p + (': ' + mixin[1].get(p) if p in mixin[1] else '') for p in mixin[0]) + ') {'
-                                        print '  ' + '\n  '.join(l for l in mixin[2].split('\n'))
-                                        print '}'
-                            else:
-                                d = dict((k[len(name) + 2:].split(':')[0], v) for k, v in options.items() if k.startswith('@' + name + ' '))
-                                pprint(sorted(d))
-                        continue
-                elif s.startswith('$') and (':' in s or '=' in s):
-                    prop, value = [a.strip() for a in _prop_split_re.split(s, 1)]
-                    prop = css.do_glob_math(prop, context, options, rule, True)
-                    value = css.calculate(value, context, options, rule)
-                    context[prop] = value
+                    yield final_cont
                     continue
-                s = to_str(css.calculate(s, context, options, rule))
-                s = css.post_process(s)
-                print s
-        print "Bye!"
-    elif options.watch:
-        import time
-        try:
-            from watchdog.observers import Observer
-            from watchdog.events import PatternMatchingEventHandler
-        except ImportError:
-            sys.stderr.write("Using watch functionality requires the `watchdog` library: http://pypi.python.org/pypi/watchdog/")
-            sys.exit(1)
-        if options.output and not os.path.isdir(options.output):
-            sys.stderr.write("watch file output directory is invalid: '%s'" % (options.output))
-            sys.exit(2)
+            elif s == 'ls' or s.startswith('show(') or s.startswith('show ') or s.startswith('ls(') or s.startswith('ls '):
+                m = re.match(r'(?:show|ls)(\()?\s*([^,/\\) ]*)(?:[,/\\ ]([^,/\\ )]+))*(?(1)\))', s, re.IGNORECASE)
+                if m:
+                    name = m.group(2)
+                    code = m.group(3)
+                    name = name and name.strip().rstrip('s')  # remove last 's' as in functions
+                    code = code and code.strip()
+                    ns = self.namespace
+                    if not name:
+                        yield pformat(list(sorted(['vars', 'options', 'mixins', 'functions'])))
+                    elif name in ('v', 'var', 'variable'):
+                        variables = dict(ns._variables)
+                        if code == '*':
+                            pass
+                        elif code:
+                            variables = dict((k, v) for k, v in variables.items() if code in k)
+                        else:
+                            variables = dict((k, v) for k, v in variables.items() if not k.startswith('$--'))
+                        yield pformat(variables)
 
-        class ScssEventHandler(PatternMatchingEventHandler):
-            def __init__(self, *args, **kwargs):
-                super(ScssEventHandler, self).__init__(*args, **kwargs)
-                self.css = Scss(scss_opts={
-                    'compress': options.compress,
-                    'debug_info': options.debug_info,
-                })
-                self.output = options.output
-                self.suffix = options.suffix
+                    elif name in ('o', 'opt', 'option'):
+                        opts = self.legacy_compiler_options
+                        if code == '*':
+                            pass
+                        elif code:
+                            opts = dict((k, v) for k, v in opts.items() if code in k)
+                        else:
+                            opts = dict((k, v) for k, v in opts.items())
+                        yield pformat(opts)
 
-            def is_valid(self, path):
-                return os.path.isfile(path) and path.endswith(".scss") and not os.path.basename(path).startswith("_")
+                    elif name in ('m', 'mix', 'mixin', 'f', 'func', 'funct', 'function'):
+                        if name.startswith('m'):
+                            funcs = dict(ns._mixins)
+                        elif name.startswith('f'):
+                            funcs = dict(ns._functions)
+                        if code == '*':
+                            pass
+                        elif code:
+                            funcs = dict((k, v) for k, v in funcs.items() if code in k[0])
+                        else:
+                            pass
+                        # TODO print source when possible
+                        yield pformat(funcs)
+                    continue
+            elif s.startswith('$') and (':' in s or '=' in s):
+                prop, value = [a.strip() for a in _prop_split_re.split(s, 1)]
+                prop = self.calculator.do_glob_math(prop)
+                value = self.calculator.calculate(value)
+                self.namespace.set_variable(prop, value)
+                continue
 
-            def process(self, path):
-                if os.path.isdir(path):
-                    for f in os.listdir(path):
-                        full = os.path.join(path, f)
-                        if self.is_valid(full):
-                            self.compile(full)
-                elif self.is_valid(path):
-                    self.compile(path)
+            # TODO respect compress?
+            try:
+                yield(self.calculator.calculate(s).render())
+            except (SyntaxError, SassEvaluationError) as e:
+                print("%s" % e, file=sys.stderr)
 
-            def compile(self, src_path):
-                fname = os.path.basename(src_path)
-                if fname.endswith(".scss"):
-                    fname = fname[:-5]
-                    if self.suffix:
-                        fname += "." + self.suffix
-                    fname += ".css"
-                else:
-                    # you didn't give me a file of the correct type!
-                    return False
-
-                if self.output:
-                    dest_path = os.path.join(self.output, fname)
-                else:
-                    dest_path = os.path.join(os.path.dirname(src_path), fname)
-
-                print "Compiling %s => %s" % (src_path, dest_path)
-                src_file = open(src_path)
-                dest_file = open(dest_path, 'w')
-                dest_file.write(self.css.compile(src_file.read()))
-
-            def on_moved(self, event):
-                super(ScssEventHandler, self).on_moved(event)
-                self.process(event.dest_path)
-
-            def on_created(self, event):
-                super(ScssEventHandler, self).on_created(event)
-                self.process(event.src_path)
-
-            def on_modified(self, event):
-                super(ScssEventHandler, self).on_modified(event)
-                self.process(event.src_path)
-
-        event_handler = ScssEventHandler(patterns="*.scss")
-        observer = Observer()
-        observer.schedule(event_handler, path=options.watch, recursive=options.recursive)
-        observer.start()
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            observer.stop()
-        observer.join()
-
-    else:
-        if options.output is not None:
-            output = open(options.output, 'wt')
-        else:
-            output = sys.stdout
-
-        css = Scss(scss_opts={
-            'compress': options.compress,
-            'debug_info': options.debug_info,
-        })
-        if args:
-            for path in args:
-                finput = open(path, 'rt')
-                output.write(css.compile(finput.read()))
-        else:
-            output.write(css.compile(sys.stdin.read()))
-
-        for f, t in profiling.items():
-            print >>sys.stderr, "%s took %03fs" % (f, t)
 
 if __name__ == "__main__":
     main()

@@ -1,12 +1,11 @@
-#!/usr/bin/env python
 #-*- coding: utf-8 -*-
 """
 pyScss, a Scss compiler for Python
 
 @author     German M. Bravo (Kronuz) <german.mb@gmail.com>
-@version    1.1.4
+@version    1.2.0 alpha
 @see        https://github.com/Kronuz/pyScss
-@copyright  (c) 2012 German M. Bravo (Kronuz)
+@copyright  (c) 2012-2013 German M. Bravo (Kronuz)
 @license    MIT License
             http://www.opensource.org/licenses/mit-license.php
 
@@ -43,9 +42,12 @@ xCSS:
     for both Py3.x and Py2.x
 
 """
+from __future__ import unicode_literals
 
-VERSION_INFO = (1, 1, 4)
-DATE_INFO = (2012, 8, 8)  # YEAR, MONTH, DAY
+import sys
+
+VERSION_INFO = (1, 3, 4)
+DATE_INFO = (2014, 12, 15)  # YEAR, MONTH, DAY
 VERSION = '.'.join(str(i) for i in VERSION_INFO)
 REVISION = '%04d%02d%02d' % DATE_INFO
 BUILD_INFO = "pyScss v" + VERSION + " (" + REVISION + ")"
@@ -55,13 +57,3 @@ URL = 'http://github.com/Kronuz/pyScss'
 DOWNLOAD_URL = 'http://github.com/Kronuz/pyScss/tarball/v' + VERSION
 LICENSE = "MIT"
 PROJECT = "pyScss"
-
-if __name__ == "__main__":
-    print('VERSION      = ' + VERSION)
-    print('REVISION     = ' + REVISION)
-    print('BUILD_INFO   = ' + BUILD_INFO)
-    print('AUTHOR       = ' + AUTHOR)
-    print('AUTHOR_EMAIL = ' + AUTHOR_EMAIL)
-    print('URL          = ' + URL)
-    print('LICENSE      = ' + LICENSE)
-    print('PROJECT      = ' + PROJECT)

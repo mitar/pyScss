@@ -15,76 +15,42 @@
 #include <string.h>
 #include "block_locator.h"
 
-int _strip(char *begin, char *end, int *lineno) {
-	// "    1\0     some,    \n  2\0 aca  "
-	int _cnt,
-		cnt = 0,
-		pass = 1,
-		addnl = 0;
-	char c,
-		*line = NULL,
-		*first = begin,
-		*last = begin,
-		*write = lineno ? begin : NULL;
-	while (begin < end) {
-		c = *begin;
-		if (c == '\0') {
-			if (lineno && line == NULL) {
-				line = first - 1;
-				do {
-					c = *++line;
-				} while (c == ' ' || c == '\t' || c == '\n' || c == ';');
-				if (c != '\0') {
-					sscanf(line, "%d", lineno);
-				}
-			}
-			first = last = begin + 1;
-			pass = 1;
-		} else if (c == '\n') {
-			_cnt = (int)(last - first);
-			if (_cnt > 0) {
-				cnt += _cnt + addnl;
-				if (write != NULL) {
-					if (addnl) {
-						*write++ = '\n';
-					}
-					while (first < last) {
-						*write++ = *first++;
-					}
-					addnl = 1;
-				}
-			}
-			first = last = begin + 1;
-			pass = 1;
-		} else if (c == ' ' || c == '\t') {
-			if (pass) {
-				first = last = begin + 1;
-			}
-		} else {
-			last = begin + 1;
-			pass = 0;
-		}
-		begin++;
+int _strip(Py_UNICODE *begin, Py_UNICODE *end, int *lineno, Py_UNICODE **out) {
+	while (begin < end && (*begin == '\n' || *begin == '\t' || *begin == ' ')) begin++;
+	if (out != NULL) {
+		*out = begin;
 	}
-	_cnt = (int)(last - first);
-	if (_cnt > 0) {
-		cnt += _cnt + addnl;
-		if (write != NULL) {
-			if (addnl) {
-				*write++ = '\n';
-			}
-			while (first < last) {
-				*write++ = *first++;
-			}
-		}
-	}
-	return cnt;
+	return (int)(end - begin);
 }
 
 
 /* BlockLocator */
 
 typedef void _BlockLocator_Callback(BlockLocator*);
+
+static void
+_BlockLocator_push_lineno(BlockLocator *self, int lineno) {
+	_lineno_stack *next = self->lineno_stack;
+	self->lineno_stack = malloc(sizeof(_lineno_stack));
+	self->lineno_stack->lineno = lineno;
+	self->lineno_stack->next = next;
+}
+
+static int
+_BlockLocator_pop_lineno(BlockLocator *self) {
+	int lineno;
+	_lineno_stack *dead;
+
+	if (self->lineno_stack == NULL) {
+		return 0;
+	}
+
+	lineno = self->lineno_stack->lineno;
+	dead = self->lineno_stack;
+	self->lineno_stack = self->lineno_stack->next;
+	free(dead);
+	return lineno;
+}
 
 static void
 _BlockLocator_start_string(BlockLocator *self) {
@@ -114,8 +80,6 @@ _BlockLocator_start_parenthesis(BlockLocator *self) {
 
 	// parenthesis begins:
 	self->par++;
-	self->thin = NULL;
-	self->safe = self->codestr_ptr + 1;
 }
 
 static void
@@ -129,7 +93,8 @@ _BlockLocator_end_parenthesis(BlockLocator *self) {
 
 static void
 _BlockLocator_flush_properties(BlockLocator *self) {
-	int len, lineno = -1;
+	int len = -1, lineno = -1;
+	Py_UNICODE *block_start = NULL;
 
 	#ifdef DEBUG
 		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
@@ -137,13 +102,9 @@ _BlockLocator_flush_properties(BlockLocator *self) {
 
 	// Flush properties
 	if (self->lose <= self->init) {
-		len = _strip(self->lose, self->init, &lineno);
+		len = _strip(self->lose, self->init, &lineno, &block_start);
 		if (len) {
-			if (lineno != -1) {
-				self->lineno = lineno;
-			}
-
-			self->block.selprop = self->lose;
+			self->block.selprop = block_start;
 			self->block.selprop_sz = len;
 			self->block.codestr = NULL;
 			self->block.codestr_sz = 0;
@@ -165,11 +126,8 @@ _BlockLocator_start_block1(BlockLocator *self) {
 		self->skip = 1;
 	} else {
 		self->start = self->codestr_ptr;
-		if (self->thin != NULL && _strip(self->thin, self->codestr_ptr, NULL)) {
-			self->init = self->thin;
-		}
+		_BlockLocator_push_lineno(self, self->lineno);
 		_BlockLocator_flush_properties(self);
-		self->thin = NULL;
 	}
 	self->depth++;
 }
@@ -187,6 +145,7 @@ _BlockLocator_start_block(BlockLocator *self) {
 static void
 _BlockLocator_end_block1(BlockLocator *self) {
 	int len, lineno = -1;
+	Py_UNICODE *block_start = NULL;
 
 	#ifdef DEBUG
 		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
@@ -196,20 +155,15 @@ _BlockLocator_end_block1(BlockLocator *self) {
 	self->depth--;
 	if (!self->skip) {
 		self->end = self->codestr_ptr;
-		len = _strip(self->init, self->start, &lineno);
-		if (lineno != -1) {
-			self->lineno = lineno;
-		}
-
-		self->block.selprop = self->init;
+		len = _strip(self->init, self->start, &lineno, &block_start);
+		self->block.selprop = block_start;
 		self->block.selprop_sz = len;
 		self->block.codestr = (self->start + 1);
 		self->block.codestr_sz = (int)(self->end - (self->start + 1));
-		self->block.lineno = self->lineno;
+		self->block.lineno = _BlockLocator_pop_lineno(self);
 		self->block.error = 1;
 
-		self->init = self->safe = self->lose = self->end + 1;
-		self->thin = NULL;
+		self->init = self->lose = self->end + 1;
 	}
 	self->skip = 0;
 }
@@ -227,6 +181,7 @@ _BlockLocator_end_block(BlockLocator *self) {
 static void
 _BlockLocator_end_property(BlockLocator *self) {
 	int len, lineno = -1;
+	Py_UNICODE *block_start = NULL;
 
 	#ifdef DEBUG
 		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
@@ -235,50 +190,16 @@ _BlockLocator_end_property(BlockLocator *self) {
 	// End of property (or block):
 	self->init = self->codestr_ptr;
 	if (self->lose <= self->init) {
-		len = _strip(self->lose, self->init, &lineno);
+		len = _strip(self->lose, self->init, &lineno, &block_start);
 		if (len) {
-			if (lineno != -1) {
-				self->lineno = lineno;
-			}
-
-			self->block.selprop = self->lose;
+			self->block.selprop = block_start;
 			self->block.selprop_sz = len;
 			self->block.codestr = NULL;
 			self->block.codestr_sz = 0;
 			self->block.lineno = self->lineno;
 			self->block.error = 1;
 		}
-		self->init = self->safe = self->lose = self->codestr_ptr + 1;
-	}
-	self->thin = NULL;
-}
-
-static void
-_BlockLocator_mark_safe(BlockLocator *self) {
-	#ifdef DEBUG
-		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
-	#endif
-
-	// We are on a safe zone
-	if (self->thin != NULL && _strip(self->thin, self->codestr_ptr, NULL)) {
-		self->init = self->thin;
-	}
-	self->thin = NULL;
-	self->safe = self->codestr_ptr + 1;
-}
-
-static void
-_BlockLocator_mark_thin(BlockLocator *self) {
-	#ifdef DEBUG
-		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
-	#endif
-
-	// Step on thin ice, if it breaks, it breaks here
-	if (self->thin != NULL && _strip(self->thin, self->codestr_ptr, NULL)) {
-		self->init = self->thin;
-		self->thin = self->codestr_ptr + 1;
-	} else if (self->thin == NULL && _strip(self->safe, self->codestr_ptr, NULL)) {
-		self->thin = self->codestr_ptr + 1;
+		self->init = self->lose = self->codestr_ptr + 1;
 	}
 }
 
@@ -301,6 +222,11 @@ init_function_map(void) {
 	for (i = 0; i < 256 * 256 * 2 * 3; i++) {
 		scss_function_map[i] = NULL;
 	}
+	/* TODO this seems unnecessarily complicated */
+	/* TODO why does this care about parentheses? */
+	/* TODO it's possible to nest a string inside another string, using #{!
+	 * should just have a general stack of the current context i think
+	 */
 	scss_function_map[(int)'\"' + 256*0 + 256*256*0 + 256*256*2*0] = _BlockLocator_start_string;
 	scss_function_map[(int)'\'' + 256*0 + 256*256*0 + 256*256*2*0] = _BlockLocator_start_string;
 	scss_function_map[(int)'\"' + 256*0 + 256*256*1 + 256*256*2*0] = _BlockLocator_start_string;
@@ -347,10 +273,6 @@ init_function_map(void) {
 
 	scss_function_map[(int)';' + 256*0 + 256*256*0 + 256*256*2*0] = _BlockLocator_end_property;
 
-	scss_function_map[(int)',' + 256*0 + 256*256*0 + 256*256*2*0] = _BlockLocator_mark_safe;
-
-	scss_function_map[(int)'\n' + 256*0 + 256*256*0 + 256*256*2*0] = _BlockLocator_mark_thin;
-
 	scss_function_map[0 + 256*0 + 256*256*0 + 256*256*2*0] = _BlockLocator_flush_properties;
 	scss_function_map[0 + 256*0 + 256*256*0 + 256*256*2*1] = _BlockLocator_flush_properties;
 	scss_function_map[0 + 256*0 + 256*256*0 + 256*256*2*2] = _BlockLocator_flush_properties;
@@ -382,7 +304,7 @@ BlockLocator_finalize(void)
 }
 
 BlockLocator *
-BlockLocator_new(char *codestr, int codestr_sz)
+BlockLocator_new(PyUnicodeObject* codestr)
 {
 	BlockLocator *self;
 
@@ -393,25 +315,22 @@ BlockLocator_new(char *codestr, int codestr_sz)
 	self = PyMem_New(BlockLocator, 1);
 	if (self) {
 		memset(self, 0, sizeof(BlockLocator));
-		self->_codestr = PyMem_New(char, codestr_sz);
-		memcpy(self->_codestr, codestr, codestr_sz);
-		self->codestr_sz = codestr_sz;
-		self->codestr = PyMem_New(char, self->codestr_sz);
-		memcpy(self->codestr, self->_codestr, self->codestr_sz);
+		Py_INCREF(codestr);
+		self->py_codestr = codestr;
+		self->codestr = PyUnicode_AS_UNICODE(codestr);
+		self->codestr_sz = PyUnicode_GetSize((PyObject*)codestr);
 		self->codestr_ptr = self->codestr;
-		self->lineno = 0;
+		self->lineno = 1;
 		self->par = 0;
 		self->instr = 0;
 		self->depth = 0;
 		self->skip = 0;
-		self->thin = self->codestr;
 		self->init = self->codestr;
-		self->safe = self->codestr;
 		self->lose = self->codestr;
 		self->start = NULL;
 		self->end = NULL;
 		#ifdef DEBUG
-			fprintf(stderr, "\tScss BlockLocator object created (%d bytes)!\n", codestr_sz);
+			fprintf(stderr, "\tScss BlockLocator object created (%ld units)!\n", self->codestr_sz);
 		#endif
 	}
 	return self;
@@ -424,8 +343,7 @@ BlockLocator_del(BlockLocator *self)
 		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
 	#endif
 
-	free(self->codestr);
-	free(self->_codestr);
+	Py_XDECREF(self->py_codestr);
 	free(self);
 }
 
@@ -436,21 +354,20 @@ BlockLocator_rewind(BlockLocator *self)
 		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
 	#endif
 
-	free(self->codestr);
-	self->codestr = PyMem_New(char, self->codestr_sz);
-	memcpy(self->codestr, self->_codestr, self->codestr_sz);
 	self->codestr_ptr = self->codestr;
-	self->lineno = 0;
+	self->lineno = 1;
 	self->par = 0;
 	self->instr = 0;
 	self->depth = 0;
 	self->skip = 0;
-	self->thin = self->codestr;
 	self->init = self->codestr;
-	self->safe = self->codestr;
 	self->lose = self->codestr;
 	self->start = NULL;
 	self->end = NULL;
+
+	while (self->lineno_stack != NULL) {
+		_BlockLocator_pop_lineno(self);
+	}
 
 	#ifdef DEBUG
 		fprintf(stderr, "\tScss BlockLocator object rewound!\n");
@@ -461,8 +378,8 @@ Block*
 BlockLocator_iternext(BlockLocator *self)
 {
 	_BlockLocator_Callback *fn;
-	char c = 0;
-	char *codestr_end = self->codestr + self->codestr_sz;
+	unsigned long c = 0;
+	Py_UNICODE *codestr_end = self->codestr + self->codestr_sz;
 
 	#ifdef DEBUG
 		fprintf(stderr, "%s\n", __PRETTY_FUNCTION__);
@@ -472,22 +389,28 @@ BlockLocator_iternext(BlockLocator *self)
 
 	while (self->codestr_ptr < codestr_end) {
 		c = *(self->codestr_ptr);
-		if (!c) {
-			self->codestr_ptr++;
-			continue;
+		if (c == '\n') {
+			self->lineno++;
 		}
 
 		repeat:
 
-		fn = scss_function_map[
-			(int)c +
-			256 * self->instr +
-			256 * 256 * (int)(self->par != 0) +
-			256 * 256 * 2 * (int)(self->depth > 1 ? 2 : self->depth)
-		];
+		if (c == '\\') {
+			/* Start of an escape sequence; ignore next character */
+			self->codestr_ptr++;
+		}
+		/* only ASCII is special syntactically */
+		else if (c < 256) {
+			fn = scss_function_map[
+				(int)c +
+				256 * self->instr +
+				256 * 256 * (int)(self->par != 0) +
+				256 * 256 * 2 * (int)(self->depth > 1 ? 2 : self->depth)
+			];
 
-		if (fn != NULL) {
-			fn(self);
+			if (fn != NULL) {
+				fn(self);
+			}
 		}
 
 		self->codestr_ptr++;
